@@ -12,6 +12,8 @@ import sys
 import time
 import uuid
 from http.cookiejar import CookieJar
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 from pathlib import Path
 from urllib import parse, request
 
@@ -37,6 +39,9 @@ def parse_args():
     parser.add_argument("--insecure", action="store_true", help="Skip HTTPS certificate verification")
     parser.add_argument("--restart-xui", action="store_true", help="Restart x-ui service after db update")
     parser.add_argument("--dry-run", action="store_true", help="Print planned changes without writing")
+    parser.add_argument("--web", action="store_true", help="Start a local web UI")
+    parser.add_argument("--web-host", default="127.0.0.1", help="Web UI bind host, default: 127.0.0.1")
+    parser.add_argument("--web-port", type=int, default=8765, help="Web UI port, default: 8765")
     parser.add_argument("--reality-private-key", default=DEFAULT_PRIVATE_KEY)
     parser.add_argument("--reality-public-key", default=DEFAULT_PUBLIC_KEY)
     parser.add_argument("--reality-target", default="www.sony.com:443")
@@ -290,14 +295,7 @@ def update_template_config(db_path, outbounds_to_add, routes_to_add):
         conn.close()
 
 
-def main():
-    args = parse_args()
-    if args.input_file:
-        text = Path(args.input_file).read_text(encoding="utf-8")
-    else:
-        print("Paste socks nodes, then press Ctrl-D:", file=sys.stderr)
-        text = sys.stdin.read()
-
+def plan_nodes(args, text):
     nodes = parse_proxy_lines(text)
     planned = []
     for idx, node in enumerate(nodes):
@@ -317,39 +315,218 @@ def main():
                 "route": build_route(inbound_tag, remark),
             }
         )
+    return planned
 
-    print(f"Planned nodes: {len(planned)}")
+
+def run_batch(args, text, emit=print):
+    planned = plan_nodes(args, text)
+
+    emit(f"Planned nodes: {len(planned)}")
     for item in planned:
-        print(f"- {item['remark']}: inbound {item['inbound_tag']}, outbound {item['outbound']['settings']['servers'][0]['address']}:{item['outbound']['settings']['servers'][0]['port']}")
+        emit(f"- {item['remark']}: inbound {item['inbound_tag']}, outbound {item['outbound']['settings']['servers'][0]['address']}:{item['outbound']['settings']['servers'][0]['port']}")
 
     if args.dry_run:
-        print("\nDry run only. No changes written.")
-        return
+        emit("\nDry run only. No changes written.")
+        return {"planned": len(planned), "dry_run": True}
 
     backup = backup_db(args.db)
-    print(f"\nDB backup: {backup}")
+    emit(f"\nDB backup: {backup}")
 
     client = PanelClient(args.panel_url, args.username, args.password, args.insecure)
     client.login()
-    print("Panel login: ok")
+    emit("Panel login: ok")
 
     for item in planned:
         client.add_inbound(item["inbound_payload"])
-        print(f"Added inbound: {item['remark']} / {item['inbound_tag']}")
+        emit(f"Added inbound: {item['remark']} / {item['inbound_tag']}")
 
     added_outbounds, added_routes = update_template_config(
         args.db,
         [item["outbound"] for item in planned],
         [item["route"] for item in planned],
     )
-    print(f"Added outbounds to xrayTemplateConfig: {added_outbounds}")
-    print(f"Added routing rules to xrayTemplateConfig: {added_routes}")
+    emit(f"Added outbounds to xrayTemplateConfig: {added_outbounds}")
+    emit(f"Added routing rules to xrayTemplateConfig: {added_routes}")
 
     if args.restart_xui:
         subprocess.run(["systemctl", "restart", "x-ui"], check=True)
-        print("Restarted x-ui service")
+        emit("Restarted x-ui service")
     else:
-        print("Done. Restart Xray/x-ui from panel, or rerun with --restart-xui.")
+        emit("Done. Restart Xray/x-ui from panel, or rerun with --restart-xui.")
+
+    return {
+        "planned": len(planned),
+        "backup": str(backup),
+        "added_outbounds": added_outbounds,
+        "added_routes": added_routes,
+    }
+
+
+WEB_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>3x-ui 批量节点创建</title>
+  <style>
+    body{margin:0;background:#f5f7fb;color:#1f2937;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+    main{width:min(1100px,calc(100% - 28px));margin:0 auto;padding:24px 0 36px}
+    h1{font-size:26px;margin:0 0 6px}.sub{color:#667085;margin:0 0 18px}
+    form{display:grid;grid-template-columns:1fr 1fr;gap:14px;background:white;border:1px solid #d8dee8;border-radius:8px;padding:16px;box-shadow:0 10px 30px rgba(17,24,39,.06)}
+    label{display:block;font-weight:700;font-size:13px;margin-bottom:7px;color:#344054}
+    input,textarea{width:100%;box-sizing:border-box;border:1px solid #d8dee8;border-radius:8px;padding:10px 12px;font:inherit;background:white}
+    textarea{min-height:260px;font-family:Consolas,monospace;font-size:13px;line-height:1.5;resize:vertical}
+    .full{grid-column:1/-1}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.checks{display:flex;gap:18px;align-items:center;flex-wrap:wrap}.checks label{margin:0;font-weight:600}
+    button{height:42px;border:0;border-radius:8px;background:#0f766e;color:white;font-weight:800;padding:0 18px;cursor:pointer}.hint{font-size:12px;color:#667085;margin-top:6px}
+    pre{white-space:pre-wrap;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px;min-height:180px;overflow:auto}
+    @media(max-width:760px){form,.row{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main>
+  <h1>3x-ui 批量节点创建</h1>
+  <p class="sub">粘贴 socks 节点后自动创建入站、追加 socks 出站和路由规则。提交前会自动备份数据库。</p>
+  <form method="post" action="/run">
+    <div class="full">
+      <label>socks 节点列表</label>
+      <textarea name="nodes" required placeholder="82.198.243.27:443:user:pass{宏}"></textarea>
+      <div class="hint">每行格式：IP:端口:用户名:密码，行尾 {宏} 会自动忽略。</div>
+    </div>
+    <div>
+      <label>面板地址</label>
+      <input name="panel_url" required placeholder="https://yy.yaml.uk:8443/面板路径">
+    </div>
+    <div class="row">
+      <div><label>账号</label><input name="username" required></div>
+      <div><label>密码</label><input name="password" type="password" required></div>
+    </div>
+    <div class="row">
+      <div><label>节点名前缀</label><input name="name_prefix" required value="德国z"></div>
+      <div><label>名称起始编号</label><input name="name_start" type="number" value="1"></div>
+    </div>
+    <div class="row">
+      <div><label>入站起始端口</label><input name="inbound_start_port" type="number" required value="11111"></div>
+      <div><label>数据库路径</label><input name="db" value="/etc/x-ui/x-ui.db"></div>
+    </div>
+    <div class="row">
+      <div><label>Reality 私钥</label><input name="reality_private_key" value="__PRIVATE_KEY__"></div>
+      <div><label>Reality 公钥</label><input name="reality_public_key" value="__PUBLIC_KEY__"></div>
+    </div>
+    <div class="row">
+      <div><label>Reality 目标</label><input name="reality_target" value="www.sony.com:443"></div>
+      <div><label>Reality SNI</label><input name="reality_sni" value="www.sony.com"></div>
+    </div>
+    <div class="full"><label>shortIds</label><input name="reality_short_ids" value="__SHORT_IDS__"></div>
+    <div class="checks full">
+      <label><input type="checkbox" name="insecure" checked> 跳过 HTTPS 证书校验</label>
+      <label><input type="checkbox" name="restart_xui" checked> 完成后重启 x-ui</label>
+      <label><input type="checkbox" name="dry_run"> 只演练不写入</label>
+    </div>
+    <div class="full"><button type="submit">开始创建</button></div>
+  </form>
+  <h2>执行结果</h2>
+  <pre>提交后这里会显示结果。</pre>
+</main>
+</body>
+</html>""".replace("__PRIVATE_KEY__", DEFAULT_PRIVATE_KEY).replace("__PUBLIC_KEY__", DEFAULT_PUBLIC_KEY).replace("__SHORT_IDS__", DEFAULT_SHORT_IDS)
+
+
+def html_escape(text):
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def web_args_from_form(form):
+    def field(name, default=""):
+        return form.get(name, [default])[0]
+
+    def int_field(name, default):
+        value = field(name, str(default)).strip()
+        return int(value or default)
+
+    return SimpleNamespace(
+        panel_url=field("panel_url").strip(),
+        username=field("username").strip(),
+        password=field("password"),
+        db=field("db", DEFAULT_DB).strip() or DEFAULT_DB,
+        name_prefix=field("name_prefix").strip(),
+        name_start=int_field("name_start", 1),
+        inbound_start_port=int_field("inbound_start_port", 11111),
+        input_file=None,
+        insecure="insecure" in form,
+        restart_xui="restart_xui" in form,
+        dry_run="dry_run" in form,
+        reality_private_key=field("reality_private_key", DEFAULT_PRIVATE_KEY).strip(),
+        reality_public_key=field("reality_public_key", DEFAULT_PUBLIC_KEY).strip(),
+        reality_target=field("reality_target", "www.sony.com:443").strip(),
+        reality_sni=field("reality_sni", "www.sony.com").strip(),
+        reality_short_ids=field("reality_short_ids", DEFAULT_SHORT_IDS).strip(),
+        fingerprint="chrome",
+        spider_x="/",
+    )
+
+
+class BatchWebHandler(BaseHTTPRequestHandler):
+    def send_html(self, body, status=200):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path not in ("/", "/run"):
+            self.send_html("Not found", 404)
+            return
+        self.send_html(WEB_HTML)
+
+    def do_POST(self):
+        if self.path != "/run":
+            self.send_html("Not found", 404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        form = parse.parse_qs(raw, keep_blank_values=True)
+        output = []
+        try:
+            args = web_args_from_form(form)
+            nodes = form.get("nodes", [""])[0]
+            run_batch(args, nodes, emit=output.append)
+        except Exception as exc:
+            output.append(f"ERROR: {exc}")
+        result = "\n".join(output)
+        page = WEB_HTML.replace("提交后这里会显示结果。", html_escape(result))
+        self.send_html(page)
+
+    def log_message(self, fmt, *args):
+        print(f"[web] {self.address_string()} - {fmt % args}")
+
+
+def start_web(args):
+    server = HTTPServer((args.web_host, args.web_port), BatchWebHandler)
+    print(f"Web UI running at http://{args.web_host}:{args.web_port}")
+    print("Keep this terminal open. Press Ctrl-C to stop.")
+    server.serve_forever()
+
+
+def main():
+    args = parse_args()
+    if args.web:
+        start_web(args)
+        return
+
+    if args.input_file:
+        text = Path(args.input_file).read_text(encoding="utf-8")
+    else:
+        print("Paste socks nodes, then press Ctrl-D:", file=sys.stderr)
+        text = sys.stdin.read()
+
+    run_batch(args, text)
 
 
 if __name__ == "__main__":

@@ -192,8 +192,10 @@ class PanelClient:
         self.username = username
         self.password = password
         self.cookies = CookieJar()
-        self.opener = request.build_opener(request.HTTPCookieProcessor(self.cookies))
-        self.context = ssl._create_unverified_context() if insecure else None
+        handlers = [request.HTTPCookieProcessor(self.cookies)]
+        if insecure:
+            handlers.append(request.HTTPSHandler(context=ssl._create_unverified_context()))
+        self.opener = request.build_opener(*handlers)
 
     def _url(self, path):
         return self.base_url + path
@@ -206,7 +208,7 @@ class PanelClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with self.opener.open(req, context=self.context, timeout=30) as resp:
+        with self.opener.open(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="replace")
 
     def post_json(self, path, payload):
@@ -217,7 +219,7 @@ class PanelClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with self.opener.open(req, context=self.context, timeout=30) as resp:
+        with self.opener.open(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="replace")
 
     def login(self):

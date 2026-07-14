@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from http.cookiejar import CookieJar
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ DEFAULT_DB = "/etc/x-ui/x-ui.db"
 DEFAULT_PRIVATE_KEY = "QLc4ia17FIhB9Vc_4yi2vpPxZoNJQLqODzJsOlQS_1M"
 DEFAULT_PUBLIC_KEY = "8Km22wZcpKxURKU_BLZA5bWcPbe7u8hvEobI8vrymTE"
 DEFAULT_SHORT_IDS = "abc5,64d48d3026a71bee,de,1dc6dcb758f649,da7fab,dea3c367a8,4b4370dc,7ec0d3e8484d"
+DOWNLOADS = {}
 
 
 def parse_args():
@@ -43,6 +45,8 @@ def parse_args():
     parser.add_argument("--web", action="store_true", help="Start a local web UI")
     parser.add_argument("--web-host", default="127.0.0.1", help="Web UI bind host, default: 127.0.0.1")
     parser.add_argument("--web-port", type=int, default=8765, help="Web UI port, default: 8765")
+    parser.add_argument("--share-host", help="Public node host/IP used for generated VLESS links and QR images")
+    parser.add_argument("--qr-output-dir", default="/root/xui-qr-zips", help="Directory for generated QR zip files")
     parser.add_argument("--reality-private-key", default=DEFAULT_PRIVATE_KEY)
     parser.add_argument("--reality-public-key", default=DEFAULT_PUBLIC_KEY)
     parser.add_argument("--reality-target", default="www.sony.com:443")
@@ -462,6 +466,82 @@ def add_inbounds_to_db(db_path, planned):
         conn.close()
 
 
+def normalize_share_host(value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if "://" in value:
+        parsed = parse.urlsplit(value)
+        value = parsed.hostname or value
+    value = value.strip().strip("/")
+    if ":" in value and not value.startswith("["):
+        # Keep IPv6 usable in URLs.
+        if value.count(":") > 1:
+            value = f"[{value}]"
+    return value
+
+
+def build_vless_link(item, args):
+    host = normalize_share_host(getattr(args, "share_host", ""))
+    if not host:
+        return ""
+
+    settings = json.loads(item["inbound_payload"]["settings"])
+    client = settings["clients"][0]
+    short_ids = [part.strip() for part in args.reality_short_ids.split(",") if part.strip()]
+    query = {
+        "type": "tcp",
+        "security": "reality",
+        "pbk": args.reality_public_key,
+        "fp": args.fingerprint,
+        "sni": args.reality_sni,
+        "sid": short_ids[0] if short_ids else "",
+        "spx": args.spider_x,
+    }
+    return (
+        f"vless://{client['id']}@{host}:{item['inbound_port']}"
+        f"?{parse.urlencode(query)}"
+        f"#{parse.quote(item['remark'])}"
+    )
+
+
+def safe_filename(value):
+    allowed = set(string.ascii_letters + string.digits + "._-")
+    cleaned = "".join(ch if ch in allowed else "_" for ch in value)
+    return cleaned.strip("._") or "node"
+
+
+def generate_qr_zip(planned, args):
+    links = [(item["remark"], build_vless_link(item, args)) for item in planned]
+    links = [(remark, link) for remark, link in links if link]
+    if not links:
+        return None
+
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise RuntimeError("QR generation requires qrcode. Install it with: apt install -y python3-qrcode python3-pil") from exc
+
+    output_dir = Path(args.qr_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    zip_path = output_dir / f"3xui-qrcodes-{stamp}.zip"
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        link_text = []
+        for remark, link in links:
+            name = safe_filename(remark)
+            img = qrcode.make(link)
+            png_path = output_dir / f"{name}.png"
+            img.save(png_path)
+            zf.write(png_path, f"{name}.png")
+            png_path.unlink(missing_ok=True)
+            link_text.append(f"{remark}\n{link}\n")
+        zf.writestr("links.txt", "\n".join(link_text))
+
+    return str(zip_path)
+
+
 def plan_nodes(args, text):
     nodes = parse_proxy_lines(text)
     planned = []
@@ -526,12 +606,18 @@ def run_batch(args, text, emit=print):
     else:
         emit("Done. Restart Xray/x-ui from panel, or rerun with --restart-xui.")
 
+    qr_zip = None
+    if normalize_share_host(getattr(args, "share_host", "")):
+        qr_zip = generate_qr_zip(planned, args)
+        emit(f"Generated QR zip: {qr_zip}")
+
     return {
         "planned": len(planned),
         "backup": str(backup),
         "added_inbounds": added_inbounds,
         "added_outbounds": added_outbounds,
         "added_routes": added_routes,
+        "qr_zip": qr_zip,
     }
 
 
@@ -576,6 +662,10 @@ WEB_HTML = """<!doctype html>
     <div class="row">
       <div><label>节点名前缀</label><input name="name_prefix" required value="德国z"></div>
       <div><label>名称起始编号</label><input name="name_start" type="number" value="1"></div>
+    </div>
+    <div class="row">
+      <div><label>节点连接地址</label><input name="share_host" placeholder="用于二维码，例如 d.yaml.uk 或 149.104.110.70"></div>
+      <div><label>二维码输出目录</label><input name="qr_output_dir" value="/root/xui-qr-zips"></div>
     </div>
     <div class="row">
       <div><label>入站起始端口</label><input name="inbound_start_port" type="number" required value="11111"></div>
@@ -640,6 +730,8 @@ def web_args_from_form(form):
         reality_target=field("reality_target", "www.sony.com:443").strip(),
         reality_sni=field("reality_sni", "www.sony.com").strip(),
         reality_short_ids=field("reality_short_ids", DEFAULT_SHORT_IDS).strip(),
+        share_host=field("share_host", "").strip(),
+        qr_output_dir=field("qr_output_dir", "/root/xui-qr-zips").strip() or "/root/xui-qr-zips",
         fingerprint="chrome",
         spider_x="/",
     )
@@ -655,6 +747,21 @@ class BatchWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path.startswith("/download/"):
+            name = parse.unquote(self.path.split("/download/", 1)[1])
+            path = DOWNLOADS.get(Path(name).name) or (Path("/root/xui-qr-zips") / Path(name).name)
+            path = Path(path)
+            if not path.exists() or path.suffix != ".zip":
+                self.send_html("Not found", 404)
+                return
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path not in ("/", "/run"):
             self.send_html("Not found", 404)
             return
@@ -668,14 +775,21 @@ class BatchWebHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         form = parse.parse_qs(raw, keep_blank_values=True)
         output = []
+        result_data = {}
         try:
             args = web_args_from_form(form)
             nodes = form.get("nodes", [""])[0]
-            run_batch(args, nodes, emit=output.append)
+            result_data = run_batch(args, nodes, emit=output.append)
         except Exception as exc:
             output.append(f"ERROR: {exc}")
         result = "\n".join(output)
-        page = WEB_HTML.replace("提交后这里会显示结果。", html_escape(result))
+        escaped = html_escape(result)
+        qr_zip = result_data.get("qr_zip") if isinstance(result_data, dict) else None
+        if qr_zip:
+            name = Path(qr_zip).name
+            DOWNLOADS[name] = qr_zip
+            escaped += f'\n\n<a style="color:#93c5fd" href="/download/{parse.quote(name)}">下载二维码 ZIP：{html_escape(name)}</a>'
+        page = WEB_HTML.replace("提交后这里会显示结果。", escaped)
         self.send_html(page)
 
     def log_message(self, fmt, *args):

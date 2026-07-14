@@ -70,11 +70,23 @@ def parse_proxy_lines(text):
         line = clean_line(raw)
         if not line:
             continue
-        parts = line.split(":")
-        if len(parts) < 4:
-            raise ValueError(f"line {line_no}: expected ip:port:user:pass, got {raw!r}")
-        address, port_text, user = parts[:3]
-        password = ":".join(parts[3:])
+
+        if "@" in line:
+            auth, server = line.rsplit("@", 1)
+            auth_parts = auth.split(":")
+            server_parts = server.rsplit(":", 1)
+            if len(auth_parts) < 2 or len(server_parts) != 2:
+                raise ValueError(f"line {line_no}: expected user:pass@ip:port, got {raw!r}")
+            user = auth_parts[0]
+            password = ":".join(auth_parts[1:])
+            address, port_text = server_parts
+        else:
+            parts = line.split(":")
+            if len(parts) < 4:
+                raise ValueError(f"line {line_no}: expected ip:port:user:pass or user:pass@ip:port, got {raw!r}")
+            address, port_text, user = parts[:3]
+            password = ":".join(parts[3:])
+
         port = int(port_text)
         if not (1 <= port <= 65535):
             raise ValueError(f"line {line_no}: invalid port {port}")
@@ -648,8 +660,8 @@ WEB_HTML = """<!doctype html>
   <form method="post" action="/run">
     <div class="full">
       <label>socks 节点列表</label>
-      <textarea name="nodes" required placeholder="82.198.243.27:443:user:pass{宏}"></textarea>
-      <div class="hint">每行格式：IP:端口:用户名:密码，行尾 {宏} 会自动忽略。</div>
+      <textarea name="nodes" required placeholder="82.198.243.27:443:user:pass{宏}&#10;user:pass@82.198.243.27:443"></textarea>
+      <div class="hint">支持两种格式：IP:端口:用户名:密码，或 用户名:密码@IP:端口；行尾 {宏} 会自动忽略。</div>
     </div>
     <div>
       <label>面板地址</label>

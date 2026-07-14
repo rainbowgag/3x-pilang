@@ -28,13 +28,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Batch add 3x-ui inbounds, socks outbounds, and routing rules."
     )
-    parser.add_argument("--panel-url", required=True, help="3x-ui panel base URL, e.g. https://host:8443/basepath")
-    parser.add_argument("--username", required=True, help="3x-ui username")
-    parser.add_argument("--password", required=True, help="3x-ui password")
+    parser.add_argument("--panel-url", help="3x-ui panel base URL, e.g. https://host:8443/basepath")
+    parser.add_argument("--username", help="3x-ui username")
+    parser.add_argument("--password", help="3x-ui password")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"3x-ui SQLite db path, default: {DEFAULT_DB}")
-    parser.add_argument("--name-prefix", required=True, help="Outbound/inbound remark prefix, e.g. 德国z")
+    parser.add_argument("--name-prefix", help="Outbound/inbound remark prefix, e.g. 德国z")
     parser.add_argument("--name-start", type=int, default=1, help="Name start index, default: 1")
-    parser.add_argument("--inbound-start-port", type=int, required=True, help="Inbound start port, e.g. 11111")
+    parser.add_argument("--inbound-start-port", type=int, help="Inbound start port, e.g. 11111")
     parser.add_argument("--input-file", help="Text file containing one proxy per line. If omitted, read stdin.")
     parser.add_argument("--insecure", action="store_true", help="Skip HTTPS certificate verification")
     parser.add_argument("--restart-xui", action="store_true", help="Restart x-ui service after db update")
@@ -519,6 +519,14 @@ def main():
     if args.web:
         start_web(args)
         return
+
+    missing = [
+        name
+        for name in ("panel_url", "username", "password", "name_prefix", "inbound_start_port")
+        if not getattr(args, name)
+    ]
+    if missing:
+        raise ValueError("missing required arguments for CLI mode: " + ", ".join(f"--{name.replace('_', '-')}" for name in missing))
 
     if args.input_file:
         text = Path(args.input_file).read_text(encoding="utf-8")

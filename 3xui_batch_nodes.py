@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--name-start", type=int, default=1, help="Name start index, default: 1")
     parser.add_argument("--inbound-start-port", type=int, help="Inbound start port, e.g. 11111")
     parser.add_argument("--input-file", help="Text file containing one proxy per line. If omitted, read stdin.")
+    parser.add_argument("--use-api", action="store_true", help="Create inbounds through panel API instead of direct SQLite insert")
     parser.add_argument("--insecure", action="store_true", help="Skip HTTPS certificate verification")
     parser.add_argument("--restart-xui", action="store_true", help="Restart x-ui service after db update")
     parser.add_argument("--dry-run", action="store_true", help="Print planned changes without writing")
@@ -297,6 +298,104 @@ def update_template_config(db_path, outbounds_to_add, routes_to_add):
         conn.close()
 
 
+def value_for_inbound_column(column, payload, index):
+    now = int(time.time() * 1000)
+    mapping = {
+        "user_id": "userId",
+        "userid": "userId",
+        "expiry_time": "expiryTime",
+        "expirytime": "expiryTime",
+        "traffic_reset": "trafficReset",
+        "trafficreset": "trafficReset",
+        "last_traffic_reset_time": "lastTrafficResetTime",
+        "lasttrafficresettime": "lastTrafficResetTime",
+        "stream_settings": "streamSettings",
+        "streamsettings": "streamSettings",
+        "node_id": "nodeId",
+        "nodeid": "nodeId",
+        "share_addr_strategy": "shareAddrStrategy",
+        "shareaddrstrategy": "shareAddrStrategy",
+        "share_addr": "shareAddr",
+        "shareaddr": "shareAddr",
+        "sub_sort_index": "subSortIndex",
+        "subsortindex": "subSortIndex",
+        "origin_node_guid": "originNodeGuid",
+        "originnodeguid": "originNodeGuid",
+        "fallback_parent": "fallbackParent",
+        "fallbackparent": "fallbackParent",
+        "created_at": "created_at",
+        "updated_at": "updated_at",
+        "last_traffic_reset_time": "lastTrafficResetTime",
+    }
+    normalized = column.lower()
+    source = mapping.get(normalized, column)
+    defaults = {
+        "userId": 0,
+        "up": 0,
+        "down": 0,
+        "total": 0,
+        "enable": True,
+        "expiryTime": 0,
+        "trafficReset": "never",
+        "lastTrafficResetTime": 0,
+        "listen": "",
+        "nodeId": None,
+        "shareAddrStrategy": "listen",
+        "shareAddr": "",
+        "subSortIndex": index + 1,
+        "originNodeGuid": "",
+        "fallbackParent": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if source in payload:
+        return payload[source]
+    if source in defaults:
+        return defaults[source]
+    return None
+
+
+def add_inbounds_to_db(db_path, planned):
+    conn = sqlite3.connect(db_path)
+    try:
+        table_info = conn.execute("pragma table_info(inbounds)").fetchall()
+        if not table_info:
+            raise RuntimeError("inbounds table not found")
+
+        columns = [row[1] for row in table_info]
+        insertable = [col for col in columns if col.lower() != "id"]
+        existing_ports = {
+            row[0] for row in conn.execute("select port from inbounds").fetchall()
+        }
+        existing_tags = {
+            row[0] for row in conn.execute("select tag from inbounds").fetchall()
+        }
+
+        added = 0
+        for index, item in enumerate(planned):
+            payload = item["inbound_payload"]
+            if payload["port"] in existing_ports:
+                raise RuntimeError(f"inbound port already exists: {payload['port']}")
+            if payload["tag"] in existing_tags:
+                raise RuntimeError(f"inbound tag already exists: {payload['tag']}")
+
+            values = [value_for_inbound_column(col, payload, index) for col in insertable]
+            placeholders = ",".join("?" for _ in insertable)
+            quoted_cols = ",".join(f"`{col}`" for col in insertable)
+            conn.execute(
+                f"insert into inbounds ({quoted_cols}) values ({placeholders})",
+                values,
+            )
+            existing_ports.add(payload["port"])
+            existing_tags.add(payload["tag"])
+            added += 1
+
+        conn.commit()
+        return added
+    finally:
+        conn.close()
+
+
 def plan_nodes(args, text):
     nodes = parse_proxy_lines(text)
     planned = []
@@ -334,13 +433,18 @@ def run_batch(args, text, emit=print):
     backup = backup_db(args.db)
     emit(f"\nDB backup: {backup}")
 
-    client = PanelClient(args.panel_url, args.username, args.password, args.insecure)
-    client.login()
-    emit("Panel login: ok")
+    if args.use_api:
+        client = PanelClient(args.panel_url, args.username, args.password, args.insecure)
+        client.login()
+        emit("Panel login: ok")
 
-    for item in planned:
-        client.add_inbound(item["inbound_payload"])
-        emit(f"Added inbound: {item['remark']} / {item['inbound_tag']}")
+        for item in planned:
+            client.add_inbound(item["inbound_payload"])
+            emit(f"Added inbound via API: {item['remark']} / {item['inbound_tag']}")
+        added_inbounds = len(planned)
+    else:
+        added_inbounds = add_inbounds_to_db(args.db, planned)
+        emit(f"Added inbounds to database: {added_inbounds}")
 
     added_outbounds, added_routes = update_template_config(
         args.db,
@@ -359,6 +463,7 @@ def run_batch(args, text, emit=print):
     return {
         "planned": len(planned),
         "backup": str(backup),
+        "added_inbounds": added_inbounds,
         "added_outbounds": added_outbounds,
         "added_routes": added_routes,
     }
@@ -387,7 +492,7 @@ WEB_HTML = """<!doctype html>
 <body>
 <main>
   <h1>3x-ui 批量节点创建</h1>
-  <p class="sub">粘贴 socks 节点后自动创建入站、追加 socks 出站和路由规则。提交前会自动备份数据库。</p>
+  <p class="sub">粘贴 socks 节点后直接写入本机 3x-ui 数据库，自动创建入站、追加 socks 出站和路由规则。提交前会自动备份数据库。</p>
   <form method="post" action="/run">
     <div class="full">
       <label>socks 节点列表</label>
@@ -396,11 +501,11 @@ WEB_HTML = """<!doctype html>
     </div>
     <div>
       <label>面板地址</label>
-      <input name="panel_url" required placeholder="https://yy.yaml.uk:8443/面板路径">
+      <input name="panel_url" placeholder="仅 API 模式需要，例如 https://yy.yaml.uk:8443/面板路径">
     </div>
     <div class="row">
-      <div><label>账号</label><input name="username" required></div>
-      <div><label>密码</label><input name="password" type="password" required></div>
+      <div><label>账号</label><input name="username" placeholder="仅 API 模式需要"></div>
+      <div><label>密码</label><input name="password" type="password" placeholder="仅 API 模式需要"></div>
     </div>
     <div class="row">
       <div><label>节点名前缀</label><input name="name_prefix" required value="德国z"></div>
@@ -423,6 +528,7 @@ WEB_HTML = """<!doctype html>
       <label><input type="checkbox" name="insecure" checked> 跳过 HTTPS 证书校验</label>
       <label><input type="checkbox" name="restart_xui" checked> 完成后重启 x-ui</label>
       <label><input type="checkbox" name="dry_run"> 只演练不写入</label>
+      <label><input type="checkbox" name="use_api"> 使用面板 API 创建入站</label>
     </div>
     <div class="full"><button type="submit">开始创建</button></div>
   </form>
@@ -459,6 +565,7 @@ def web_args_from_form(form):
         name_start=int_field("name_start", 1),
         inbound_start_port=int_field("inbound_start_port", 11111),
         input_file=None,
+        use_api="use_api" in form,
         insecure="insecure" in form,
         restart_xui="restart_xui" in form,
         dry_run="dry_run" in form,
@@ -522,11 +629,10 @@ def main():
         start_web(args)
         return
 
-    missing = [
-        name
-        for name in ("panel_url", "username", "password", "name_prefix", "inbound_start_port")
-        if not getattr(args, name)
-    ]
+    required = ["name_prefix", "inbound_start_port"]
+    if args.use_api:
+        required.extend(["panel_url", "username", "password"])
+    missing = [name for name in required if not getattr(args, name)]
     if missing:
         raise ValueError("missing required arguments for CLI mode: " + ", ".join(f"--{name.replace('_', '-')}" for name in missing))
 

@@ -124,22 +124,31 @@ def build_route(inbound_tag, outbound_tag):
 def build_inbound_payload(args, remark, inbound_port, inbound_tag):
     client_id = str(uuid.uuid4())
     email = rand_text(10)
+    now = int(time.time() * 1000)
+    sub_id = rand_text(16)
     settings = {
         "clients": [
             {
+                "auth": rand_text(16),
+                "comment": remark,
+                "created_at": now,
                 "id": client_id,
                 "email": email,
                 "enable": True,
                 "expiryTime": 0,
                 "flow": "",
                 "limitIp": 0,
-                "subId": rand_text(16),
-                "tgId": "",
-                "totalGB": 0,
+                "password": rand_text(16),
                 "reset": 0,
+                "security": "auto",
+                "subId": sub_id,
+                "tgId": 0,
+                "totalGB": 0,
+                "updated_at": now,
             }
         ],
         "decryption": "none",
+        "encryption": "none",
     }
     short_ids = [item.strip() for item in args.reality_short_ids.split(",") if item.strip()]
     stream_settings = {
@@ -171,6 +180,7 @@ def build_inbound_payload(args, remark, inbound_port, inbound_tag):
     }
     sniffing = {"enabled": False, "destOverride": ["http", "tls", "quic", "fakedns"]}
     return {
+        "userId": 1,
         "up": 0,
         "down": 0,
         "total": 0,
@@ -330,7 +340,7 @@ def value_for_inbound_column(column, payload, index):
     normalized = column.lower()
     source = mapping.get(normalized, column)
     defaults = {
-        "userId": 0,
+        "userId": 1,
         "up": 0,
         "down": 0,
         "total": 0,
@@ -353,6 +363,61 @@ def value_for_inbound_column(column, payload, index):
     if source in defaults:
         return defaults[source]
     return None
+
+
+def add_client_record(conn, inbound_id, payload):
+    settings = json.loads(payload["settings"])
+    clients = settings.get("clients") or []
+    now = int(time.time() * 1000)
+
+    for client in clients:
+        email = client.get("email")
+        if not email:
+            continue
+
+        existing = conn.execute("select id from clients where email=?", (email,)).fetchone()
+        if existing:
+            client_id = existing[0]
+        else:
+            cursor = conn.execute(
+                """
+                insert into clients (
+                    email, sub_id, uuid, password, auth, flow, security, reverse,
+                    limit_ip, total_gb, expiry_time, enable, tg_id, group_name,
+                    comment, reset, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    client.get("subId", ""),
+                    client.get("id", ""),
+                    client.get("password", ""),
+                    client.get("auth", ""),
+                    client.get("flow", ""),
+                    client.get("security", "auto"),
+                    "",
+                    int(client.get("limitIp") or 0),
+                    int(client.get("totalGB") or 0),
+                    int(client.get("expiryTime") or 0),
+                    bool(client.get("enable", True)),
+                    int(client.get("tgId") or 0),
+                    "",
+                    client.get("comment") or payload.get("remark") or "",
+                    int(client.get("reset") or 0),
+                    int(client.get("created_at") or now),
+                    int(client.get("updated_at") or now),
+                ),
+            )
+            client_id = cursor.lastrowid
+
+        conn.execute(
+            """
+            insert or ignore into client_inbounds
+                (client_id, inbound_id, flow_override, created_at)
+            values (?, ?, ?, ?)
+            """,
+            (client_id, inbound_id, client.get("flow", ""), now),
+        )
 
 
 def add_inbounds_to_db(db_path, planned):
@@ -382,10 +447,11 @@ def add_inbounds_to_db(db_path, planned):
             values = [value_for_inbound_column(col, payload, index) for col in insertable]
             placeholders = ",".join("?" for _ in insertable)
             quoted_cols = ",".join(f"`{col}`" for col in insertable)
-            conn.execute(
+            cursor = conn.execute(
                 f"insert into inbounds ({quoted_cols}) values ({placeholders})",
                 values,
             )
+            add_client_record(conn, cursor.lastrowid, payload)
             existing_ports.add(payload["port"])
             existing_tags.add(payload["tag"])
             added += 1

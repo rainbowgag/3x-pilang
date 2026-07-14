@@ -24,6 +24,7 @@ DEFAULT_PRIVATE_KEY = "QLc4ia17FIhB9Vc_4yi2vpPxZoNJQLqODzJsOlQS_1M"
 DEFAULT_PUBLIC_KEY = "8Km22wZcpKxURKU_BLZA5bWcPbe7u8hvEobI8vrymTE"
 DEFAULT_SHORT_IDS = "abc5,64d48d3026a71bee,de,1dc6dcb758f649,da7fab,dea3c367a8,4b4370dc,7ec0d3e8484d"
 DOWNLOADS = {}
+RESULTS = {}
 
 
 def parse_args():
@@ -869,6 +870,12 @@ class BatchWebHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if self.path.startswith("/result/"):
+            token = self.path.split("/result/", 1)[1].split("?", 1)[0]
+            result = RESULTS.get(token, "结果已过期或不存在。")
+            page = WEB_HTML.replace("提交后这里会显示结果。", result)
+            self.send_html(page)
+            return
         if self.path not in ("/", "/run"):
             self.send_html("Not found", 404)
             return
@@ -896,8 +903,11 @@ class BatchWebHandler(BaseHTTPRequestHandler):
             name = Path(qr_zip).name
             DOWNLOADS[name] = qr_zip
             escaped += f'\n\n<a style="color:#93c5fd" href="/download/{parse.quote(name)}">下载二维码 ZIP：{html_escape(name)}</a>'
-        page = WEB_HTML.replace("提交后这里会显示结果。", escaped)
-        self.send_html(page)
+        token = uuid.uuid4().hex
+        RESULTS[token] = escaped
+        self.send_response(303)
+        self.send_header("Location", f"/result/{token}")
+        self.end_headers()
 
     def log_message(self, fmt, *args):
         print(f"[web] {self.address_string()} - {fmt % args}")

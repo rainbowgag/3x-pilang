@@ -286,42 +286,49 @@ def backup_db(db_path):
 def update_template_config(db_path, outbounds_to_add, routes_to_add):
     conn = sqlite3.connect(db_path)
     try:
-        row = conn.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
-        if not row:
-            raise RuntimeError("settings.xrayTemplateConfig not found")
-        config = json.loads(row[0])
-        config.setdefault("outbounds", [])
-        config.setdefault("routing", {}).setdefault("rules", [])
-
-        outbounds = config["outbounds"]
-        rules = config["routing"]["rules"]
-        existing_outbound_tags = {item.get("tag") for item in outbounds}
-        existing_route_keys = {
-            (tuple(item.get("inboundTag") or []), item.get("outboundTag"))
-            for item in rules
-        }
-
-        added_outbounds = 0
-        for outbound in outbounds_to_add:
-            if outbound["tag"] not in existing_outbound_tags:
-                outbounds.append(outbound)
-                existing_outbound_tags.add(outbound["tag"])
-                added_outbounds += 1
-
-        added_routes = 0
-        for rule in routes_to_add:
-            key = (tuple(rule.get("inboundTag") or []), rule.get("outboundTag"))
-            if key not in existing_route_keys:
-                rules.append(rule)
-                existing_route_keys.add(key)
-                added_routes += 1
-
-        text = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
-        conn.execute("update settings set value=? where key='xrayTemplateConfig'", (text,))
+        added_outbounds, added_routes = update_template_config_conn(
+            conn, outbounds_to_add, routes_to_add
+        )
         conn.commit()
         return added_outbounds, added_routes
     finally:
         conn.close()
+
+
+def update_template_config_conn(conn, outbounds_to_add, routes_to_add):
+    row = conn.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+    if not row:
+        raise RuntimeError("settings.xrayTemplateConfig not found")
+    config = json.loads(row[0])
+    config.setdefault("outbounds", [])
+    config.setdefault("routing", {}).setdefault("rules", [])
+
+    outbounds = config["outbounds"]
+    rules = config["routing"]["rules"]
+    existing_outbound_tags = {item.get("tag") for item in outbounds}
+    existing_route_keys = {
+        (tuple(item.get("inboundTag") or []), item.get("outboundTag"))
+        for item in rules
+    }
+
+    added_outbounds = 0
+    for outbound in outbounds_to_add:
+        if outbound["tag"] not in existing_outbound_tags:
+            outbounds.append(outbound)
+            existing_outbound_tags.add(outbound["tag"])
+            added_outbounds += 1
+
+    added_routes = 0
+    for rule in routes_to_add:
+        key = (tuple(rule.get("inboundTag") or []), rule.get("outboundTag"))
+        if key not in existing_route_keys:
+            rules.append(rule)
+            existing_route_keys.add(key)
+            added_routes += 1
+
+    text = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+    conn.execute("update settings set value=? where key='xrayTemplateConfig'", (text,))
+    return added_outbounds, added_routes
 
 
 def value_for_inbound_column(column, payload, index):
@@ -438,42 +445,123 @@ def add_client_record(conn, inbound_id, payload):
 
 def add_inbounds_to_db(db_path, planned):
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     try:
-        table_info = conn.execute("pragma table_info(inbounds)").fetchall()
-        if not table_info:
-            raise RuntimeError("inbounds table not found")
+        added, skipped = add_inbounds_to_db_conn(conn, planned)
+        conn.commit()
+        return added, skipped
+    finally:
+        conn.close()
 
-        columns = [row[1] for row in table_info]
-        insertable = [col for col in columns if col.lower() != "id"]
-        existing_ports = {
-            row[0] for row in conn.execute("select port from inbounds").fetchall()
+
+def add_inbounds_to_db_conn(conn, planned):
+    table_info = conn.execute("pragma table_info(inbounds)").fetchall()
+    if not table_info:
+        raise RuntimeError("inbounds table not found")
+
+    columns = [row[1] for row in table_info]
+    insertable = [col for col in columns if col.lower() != "id"]
+    existing_by_port = {
+        row["port"]: row
+        for row in conn.execute("select id, remark, port, tag, settings from inbounds").fetchall()
+    }
+    existing_by_tag = {
+        row["tag"]: row
+        for row in conn.execute("select id, remark, port, tag, settings from inbounds").fetchall()
+    }
+
+    added = 0
+    skipped = 0
+    for index, item in enumerate(planned):
+        payload = item["inbound_payload"]
+        port_row = existing_by_port.get(payload["port"])
+        tag_row = existing_by_tag.get(payload["tag"])
+
+        if port_row or tag_row:
+            row = port_row or tag_row
+            if row["port"] != payload["port"] or row["tag"] != payload["tag"]:
+                raise RuntimeError(
+                    f"inbound conflict: port {payload['port']} or tag {payload['tag']} already used by {row['tag']}:{row['port']}"
+                )
+            existing_payload = {
+                "settings": row["settings"],
+                "remark": row["remark"],
+            }
+            add_client_record(conn, row["id"], existing_payload)
+            skipped += 1
+            continue
+
+        values = [value_for_inbound_column(col, payload, index) for col in insertable]
+        placeholders = ",".join("?" for _ in insertable)
+        quoted_cols = ",".join(f"`{col}`" for col in insertable)
+        cursor = conn.execute(
+            f"insert into inbounds ({quoted_cols}) values ({placeholders})",
+            values,
+        )
+        add_client_record(conn, cursor.lastrowid, payload)
+        new_row = {
+            "id": cursor.lastrowid,
+            "remark": payload["remark"],
+            "port": payload["port"],
+            "tag": payload["tag"],
+            "settings": payload["settings"],
         }
-        existing_tags = {
+        existing_by_port[payload["port"]] = new_row
+        existing_by_tag[payload["tag"]] = new_row
+        added += 1
+
+    return added, skipped
+
+
+def apply_batch_to_db(db_path, planned):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("begin")
+        added_inbounds, skipped_inbounds = add_inbounds_to_db_conn(conn, planned)
+        added_outbounds, added_routes = update_template_config_conn(
+            conn,
+            [item["outbound"] for item in planned],
+            [item["route"] for item in planned],
+        )
+        conn.commit()
+        return added_inbounds, skipped_inbounds, added_outbounds, added_routes
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def verify_batch_in_db(db_path, planned):
+    conn = sqlite3.connect(db_path)
+    try:
+        inbound_tags = {
             row[0] for row in conn.execute("select tag from inbounds").fetchall()
         }
+        row = conn.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+        if not row:
+            raise RuntimeError("settings.xrayTemplateConfig not found after write")
+        config = json.loads(row[0])
+        outbound_tags = {item.get("tag") for item in config.get("outbounds", [])}
+        route_keys = {
+            (tuple(item.get("inboundTag") or []), item.get("outboundTag"))
+            for item in config.get("routing", {}).get("rules", [])
+        }
 
-        added = 0
-        for index, item in enumerate(planned):
-            payload = item["inbound_payload"]
-            if payload["port"] in existing_ports:
-                raise RuntimeError(f"inbound port already exists: {payload['port']}")
-            if payload["tag"] in existing_tags:
-                raise RuntimeError(f"inbound tag already exists: {payload['tag']}")
+        missing = []
+        for item in planned:
+            if item["inbound_tag"] not in inbound_tags:
+                missing.append(f"inbound {item['inbound_tag']}")
+            if item["remark"] not in outbound_tags:
+                missing.append(f"outbound {item['remark']}")
+            route_key = ((item["inbound_tag"],), item["remark"])
+            if route_key not in route_keys:
+                missing.append(f"route {item['inbound_tag']} -> {item['remark']}")
 
-            values = [value_for_inbound_column(col, payload, index) for col in insertable]
-            placeholders = ",".join("?" for _ in insertable)
-            quoted_cols = ",".join(f"`{col}`" for col in insertable)
-            cursor = conn.execute(
-                f"insert into inbounds ({quoted_cols}) values ({placeholders})",
-                values,
-            )
-            add_client_record(conn, cursor.lastrowid, payload)
-            existing_ports.add(payload["port"])
-            existing_tags.add(payload["tag"])
-            added += 1
-
-        conn.commit()
-        return added
+        if missing:
+            raise RuntimeError("write verification failed: " + ", ".join(missing))
+        return True
     finally:
         conn.close()
 
@@ -600,17 +688,23 @@ def run_batch(args, text, emit=print):
             client.add_inbound(item["inbound_payload"])
             emit(f"Added inbound via API: {item['remark']} / {item['inbound_tag']}")
         added_inbounds = len(planned)
+        skipped_inbounds = 0
+        added_outbounds, added_routes = update_template_config(
+            args.db,
+            [item["outbound"] for item in planned],
+            [item["route"] for item in planned],
+        )
     else:
-        added_inbounds = add_inbounds_to_db(args.db, planned)
+        added_inbounds, skipped_inbounds, added_outbounds, added_routes = apply_batch_to_db(
+            args.db, planned
+        )
         emit(f"Added inbounds to database: {added_inbounds}")
-
-    added_outbounds, added_routes = update_template_config(
-        args.db,
-        [item["outbound"] for item in planned],
-        [item["route"] for item in planned],
-    )
+        if skipped_inbounds:
+            emit(f"Skipped existing inbounds and repaired client links: {skipped_inbounds}")
     emit(f"Added outbounds to xrayTemplateConfig: {added_outbounds}")
     emit(f"Added routing rules to xrayTemplateConfig: {added_routes}")
+    verify_batch_in_db(args.db, planned)
+    emit("Verified database: inbounds, outbounds, and routing rules are present")
 
     if args.restart_xui:
         subprocess.run(["systemctl", "restart", "x-ui"], check=True)
@@ -627,6 +721,7 @@ def run_batch(args, text, emit=print):
         "planned": len(planned),
         "backup": str(backup),
         "added_inbounds": added_inbounds,
+        "skipped_inbounds": skipped_inbounds,
         "added_outbounds": added_outbounds,
         "added_routes": added_routes,
         "qr_zip": qr_zip,

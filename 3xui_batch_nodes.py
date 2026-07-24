@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--db", default=DEFAULT_DB, help=f"3x-ui SQLite db path, default: {DEFAULT_DB}")
     parser.add_argument("--name-prefix", help="Outbound/inbound remark prefix, e.g. 德国z")
     parser.add_argument("--name-start", type=int, default=1, help="Name start index, default: 1")
-    parser.add_argument("--inbound-start-port", type=int, help="Inbound start port, e.g. 11111")
+    parser.add_argument("--inbound-start-port", type=int, help="Inbound start port, e.g. 11112")
     parser.add_argument("--input-file", help="Text file containing one proxy per line. If omitted, read stdin.")
     parser.add_argument("--use-api", action="store_true", help="Create inbounds through panel API instead of direct SQLite insert")
     parser.add_argument("--insecure", action="store_true", help="Skip HTTPS certificate verification")
@@ -753,7 +753,7 @@ WEB_HTML = """<!doctype html>
       <div><label>名称起始编号</label><input name="name_start" type="number" value="1"></div>
     </div>
     <div class="row">
-      <div><label>入站起始端口</label><input name="inbound_start_port" type="number" required value="11111"></div>
+      <div><label>入站起始端口</label><input name="inbound_start_port" type="number" required value="11112"></div>
       <div><label>数据库路径</label><input name="db" value="/etc/x-ui/x-ui.db"></div>
     </div>
     <div class="row">
@@ -804,7 +804,7 @@ def web_args_from_form(form):
         db=field("db", DEFAULT_DB).strip() or DEFAULT_DB,
         name_prefix=field("name_prefix").strip(),
         name_start=int_field("name_start", 1),
-        inbound_start_port=int_field("inbound_start_port", 11111),
+        inbound_start_port=int_field("inbound_start_port", 11112),
         input_file=None,
         use_api="use_api" in form,
         insecure="insecure" in form,

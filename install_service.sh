@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/root/3x-pilang"
+APP_DIR="${APP_DIR:-/root/3x-pilang}"
 SERVICE_FILE="/etc/systemd/system/3x-pilang-web.service"
 HOST="${WEB_HOST:-0.0.0.0}"
 PORT="${WEB_PORT:-8765}"

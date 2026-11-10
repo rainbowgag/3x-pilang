@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import os
 import random
@@ -27,7 +28,7 @@ RESULTS = {}
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Batch add 3x-ui inbounds, socks outbounds, and routing rules."
+        description="Batch add 3x-ui inbounds, socks/vmess outbounds, and routing rules."
     )
     parser.add_argument("--panel-url", help="3x-ui panel base URL, e.g. https://host:8443/basepath")
     parser.add_argument("--username", help="3x-ui username")
@@ -61,11 +62,97 @@ def clean_line(line):
     return line
 
 
+def decode_vmess_json(encoded):
+    encoded = encoded.strip()
+    if not encoded:
+        raise ValueError("empty vmess payload")
+
+    padded = encoded + "=" * (-len(encoded) % 4)
+    last_error = None
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            decoded = decoder(padded.encode("ascii")).decode("utf-8")
+            data = json.loads(decoded)
+            if not isinstance(data, dict):
+                raise ValueError("decoded payload is not a JSON object")
+            return data
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f"unable to decode vmess payload: {last_error}")
+
+
+def parse_vmess_line(line, line_no):
+    encoded = line.split("://", 1)[1].strip()
+    try:
+        data = decode_vmess_json(encoded)
+    except Exception as exc:
+        raise ValueError(f"line {line_no}: invalid vmess payload: {exc}") from exc
+
+    address = str(data.get("add") or "").strip()
+    uuid = str(data.get("id") or "").strip()
+    if not address:
+        raise ValueError(f"line {line_no}: vmess node missing add/address")
+    if not uuid:
+        raise ValueError(f"line {line_no}: vmess node missing id")
+
+    try:
+        port = int(data.get("port"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"line {line_no}: invalid vmess port {data.get('port')!r}") from exc
+    if not (1 <= port <= 65535):
+        raise ValueError(f"line {line_no}: invalid vmess port {port}")
+
+    def as_int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def as_bool(value, default=False):
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in ("", "0", "false", "no", "off", "none"):
+            return False
+        if text in ("1", "true", "yes", "on", "tls"):
+            return True
+        return bool(value)
+
+    net = str(data.get("net") or "tcp").strip().lower()
+    if net == "h2":
+        net = "http"
+    elif net in ("websocket",):
+        net = "ws"
+
+    return {
+        "protocol": "vmess",
+        "address": address,
+        "port": port,
+        "uuid": uuid,
+        "aid": as_int(data.get("aid"), 0),
+        "security": str(data.get("scy") or "auto").strip().lower(),
+        "ps": str(data.get("ps") or "").strip(),
+        "net": net,
+        "type": str(data.get("type") or "none").strip().lower(),
+        "host": str(data.get("host") or "").strip(),
+        "path": str(data.get("path") or "/").strip(),
+        "tls": as_bool(data.get("tls"), False),
+        "sni": str(data.get("sni") or "").strip(),
+        "alpn": str(data.get("alpn") or "").strip(),
+        "fp": str(data.get("fp") or "").strip(),
+        "insecure": as_bool(data.get("insecure"), False),
+    }
+
+
 def parse_proxy_lines(text):
     nodes = []
     for line_no, raw in enumerate(text.splitlines(), 1):
         line = clean_line(raw)
         if not line:
+            continue
+
+        if line.lower().startswith("vmess://"):
+            nodes.append(parse_vmess_line(line, line_no))
             continue
 
         if "@" in line:
@@ -89,6 +176,7 @@ def parse_proxy_lines(text):
             raise ValueError(f"line {line_no}: invalid port {port}")
         nodes.append(
             {
+                "protocol": "socks",
                 "address": address.strip(),
                 "port": port,
                 "user": user.strip(),
@@ -96,7 +184,7 @@ def parse_proxy_lines(text):
             }
         )
     if not nodes:
-        raise ValueError("no valid socks nodes found")
+        raise ValueError("no valid socks or vmess nodes found")
     return nodes
 
 
@@ -124,6 +212,92 @@ def build_socks_outbound(tag, node):
             ]
         },
     }
+
+
+def build_vmess_stream_settings(node):
+    network = node.get("net") or "tcp"
+    stream = {"network": network}
+
+    if network == "tcp":
+        header_type = (node.get("type") or "none").lower()
+        if header_type in ("", "none"):
+            stream["tcpSettings"] = {"header": {"type": "none"}}
+        elif header_type == "http":
+            request = {
+                "version": "1.1",
+                "method": "GET",
+                "path": [node.get("path") or "/"],
+            }
+            if node.get("host"):
+                request["headers"] = {"Host": [node["host"]]}
+            stream["tcpSettings"] = {"header": {"type": "http", "request": request}}
+        else:
+            raise ValueError(f"unsupported tcp header type: {header_type}")
+    elif network == "ws":
+        ws_settings = {"path": node.get("path") or "/"}
+        if node.get("host"):
+            ws_settings["headers"] = {"Host": node["host"]}
+        stream["wsSettings"] = ws_settings
+    elif network == "http":
+        http_settings = {"path": node.get("path") or "/"}
+        if node.get("host"):
+            http_settings["host"] = [node["host"]]
+        stream["httpSettings"] = http_settings
+    elif network == "grpc":
+        stream["grpcSettings"] = {
+            "serviceName": (node.get("path") or "").lstrip("/")
+        }
+    else:
+        raise ValueError(
+            f"unsupported vmess transport: {network}. "
+            "supported transports: tcp, ws, http/h2, grpc"
+        )
+
+    if node.get("tls"):
+        stream["security"] = "tls"
+        tls_settings = {"allowInsecure": bool(node.get("insecure"))}
+        server_name = node.get("sni") or node.get("host") or node.get("address")
+        if server_name:
+            tls_settings["serverName"] = server_name
+        if node.get("fp"):
+            tls_settings["fingerprint"] = node["fp"]
+        alpn = node.get("alpn")
+        if alpn:
+            alpn_list = [item.strip() for item in alpn.split(",") if item.strip()]
+            if alpn_list:
+                tls_settings["alpn"] = alpn_list
+        stream["tlsSettings"] = tls_settings
+
+    return stream
+
+
+def build_vmess_outbound(tag, node):
+    return {
+        "tag": tag,
+        "protocol": "vmess",
+        "settings": {
+            "vnext": [
+                {
+                    "address": node["address"],
+                    "port": node["port"],
+                    "users": [
+                        {
+                            "id": node["uuid"],
+                            "alterId": node["aid"],
+                            "security": node.get("security") or "auto",
+                        }
+                    ],
+                }
+            ]
+        },
+        "streamSettings": build_vmess_stream_settings(node),
+    }
+
+
+def build_outbound(tag, node):
+    if node.get("protocol") == "vmess":
+        return build_vmess_outbound(tag, node)
+    return build_socks_outbound(tag, node)
 
 
 def build_route(inbound_tag, outbound_tag):
@@ -643,10 +817,11 @@ def plan_nodes(args, text):
         planned.append(
             {
                 "remark": remark,
+                "node": node,
                 "inbound_port": inbound_port,
                 "inbound_tag": inbound_tag,
                 "inbound_payload": build_inbound_payload(args, remark, inbound_port, inbound_tag),
-                "outbound": build_socks_outbound(remark, node),
+                "outbound": build_outbound(remark, node),
                 "route": build_route(inbound_tag, remark),
             }
         )
@@ -658,7 +833,12 @@ def run_batch(args, text, emit=print):
 
     emit(f"Planned nodes: {len(planned)}")
     for item in planned:
-        emit(f"- {item['remark']}: inbound {item['inbound_tag']}, outbound {item['outbound']['settings']['servers'][0]['address']}:{item['outbound']['settings']['servers'][0]['port']}")
+        node = item["node"]
+        emit(
+            f"- {item['remark']}: inbound {item['inbound_tag']}, "
+            f"outbound {node.get('protocol', 'socks')} "
+            f"{node['address']}:{node['port']}"
+        )
 
     if args.dry_run:
         emit("\nDry run only. No changes written.")
@@ -733,12 +913,12 @@ WEB_HTML = """<!doctype html>
 <body>
 <main>
   <h1>3x-ui 批量节点创建</h1>
-  <p class="sub">粘贴 socks 节点后直接写入本机 3x-ui 数据库，自动创建入站、追加 socks 出站和路由规则。提交前会自动备份数据库。</p>
+  <p class="sub">粘贴 socks/vmess 节点后直接写入本机 3x-ui 数据库，自动创建入站、追加 socks/vmess 出站和路由规则。提交前会自动备份数据库。</p>
   <form method="post" action="/run">
     <div class="full">
       <label>socks 节点列表</label>
-      <textarea name="nodes" required placeholder="82.198.243.27:443:user:pass{宏}&#10;user:pass@82.198.243.27:443"></textarea>
-      <div class="hint">支持两种格式：IP:端口:用户名:密码，或 用户名:密码@IP:端口；行尾 {宏} 会自动忽略。</div>
+      <textarea name="nodes" required placeholder="82.198.243.27:443:user:pass{宏}&#10;user:pass@82.198.243.27:443&#10;vmess://ew0KICAidiI6ICIyIiwgImFkZCI6ICIyMy4xNDguMjAuODgiLCAicG9ydCI6IDUyMjEwLCAiaWQiOiAiMDU5OWRhOGMtMzM4Zi00Y2U5LThjOGYtODQ1ODBlM2FmOTQ3IiwgIm5ldCI6ICJ0Y3AiLCAidHlwZSI6ICJodHRwIn0="></textarea>
+      <div class="hint">支持 socks：IP:端口:用户名:密码 或 用户名:密码@IP:端口；也支持 vmess://base64 链接。行尾 {宏} 会自动忽略。</div>
     </div>
     <div>
       <label>面板地址</label>

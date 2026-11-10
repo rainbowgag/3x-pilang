@@ -1,11 +1,12 @@
 # 3x-pilang
 
-一个运行在 3x-ui 面板服务器上的批量节点工具。把一批 SOCKS5 节点粘进去，它会自动写入本机 3x-ui 的 SQLite 数据库（或通过面板 API），为每个节点创建 VLESS + Reality 入站，并追加对应的 SOCKS 出站和路由规则。
+一个运行在 3x-ui 面板服务器上的批量节点工具。把一批 SOCKS5 或 VMess 节点粘进去，它会自动写入本机 3x-ui 的 SQLite 数据库（或通过面板 API），为每个节点创建 VLESS + Reality 入站，并追加对应的 SOCKS/VMess 出站和路由规则。
 
 ## 功能
 
 - 支持直接读写 `/etc/x-ui/x-ui.db`，速度快，无需逐个通过面板操作。
 - 支持通过 3x-ui 面板 API 创建入站。
+- 支持 SOCKS5 节点和 `vmess://` 链接批量导入。
 - 同时创建本地 Web UI 和命令行两种使用方式。
 - 写入前自动备份数据库到 `/root/xui-batch-backups`。
 - 自动生成 UUID、客户端、Reality 配置，并为每个节点设置独立端口和备注名。
@@ -44,7 +45,9 @@ bash /root/3x-pilang/install_service.sh
 
 ## 节点输入格式
 
-每行一个 SOCKS5 节点，支持以下两种写法：
+每行一个节点，支持 SOCKS5 和 `vmess://` 链接。
+
+SOCKS5 写法：
 
 ```text
 82.198.243.27:443:user:pass
@@ -57,10 +60,20 @@ user:pass@82.198.243.27:443
 82.198.243.27:443:user:pass{宏}
 ```
 
+VMess 写法：
+
+```text
+vmess://ew0KICAidiI6ICIyIiwgImFkZCI6ICIyMy4xNDguMjAuODgiLCAicG9ydCI6ICI1MjIxMCIsICJpZCI6ICIwNTk5ZGE4Yy0zMzhmLTRjZTktOGM4Zi04NDU4MGUzYWY5NDciLCAibmV0IjogInRjcCIsICJ0eXBlIjogImh0dHAifQ==
+```
+
+`vmess://` 后面是 Base64 编码的 JSON，脚本会自动读取 `add`、`port`、`id`、`aid`、`scy`、`net`、`type`、`host`、`path`、`tls`、`sni`、`fp`、`alpn`、`insecure` 等字段。当前支持 `tcp`、`ws`、`http/h2`、`grpc` 传输；其他传输方式会报错并停止本次导入。
+
+> 目前 VMess 链接里的 `ps` 字段不会直接作为备注名，入站和出站仍然按“名称前缀 + 编号”生成，与 SOCKS 节点保持一致。
+
 ## Web UI 使用
 
 1. 打开 `http://服务器IP:8765`。
-2. 粘贴节点列表。
+2. 粘贴节点列表，SOCKS 和 `vmess://` 可以混合。
 3. 填写“节点名前缀”和“入站起始端口”。
 4. 可选填写面板地址、账号、密码，并勾选“使用面板 API 创建入站”；不勾选则直接写数据库。
 5. 点击“开始创建”。
@@ -95,6 +108,7 @@ python3 /root/3x-pilang/3xui_batch_nodes.py \
   --restart-xui <<'EOF'
 82.198.243.27:443:user:pass
 user:pass@82.198.243.27:443
+vmess://ew0KICAidiI6ICIyIiwgImFkZCI6ICIyMy4xNDguMjAuODgiLCAicG9ydCI6ICI1MjIxMCIsICJpZCI6ICIwNTk5ZGE4Yy0zMzhmLTRjZTktOGM4Zi04NDU4MGUzYWY5NDciLCAibmV0IjogInRjcCIsICJ0eXBlIjogImh0dHAifQ==
 EOF
 ```
 

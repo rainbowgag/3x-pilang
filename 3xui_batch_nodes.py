@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument("--reality-sni", default="www.sony.com")
     parser.add_argument("--reality-short-ids", default=DEFAULT_SHORT_IDS)
     parser.add_argument("--fingerprint", default="chrome")
-    parser.add_argument("--spider-x", default="/")
+    parser.add_argument("--spider-x", default="")
     return parser.parse_args()
 
 
@@ -996,7 +996,7 @@ def web_args_from_form(form):
         reality_sni=field("reality_sni", "www.sony.com").strip(),
         reality_short_ids=field("reality_short_ids", DEFAULT_SHORT_IDS).strip(),
         fingerprint="chrome",
-        spider_x="/",
+        spider_x="",
     )
 
 

@@ -162,7 +162,7 @@ python3 /root/3x-pilang/3xui_batch_nodes.py \
 | `--reality-sni` | Reality SNI，默认 `www.sony.com` |
 | `--reality-short-ids` | 逗号分隔的 shortIds |
 | `--fingerprint` | 浏览器指纹，默认 `chrome` |
-| `--spider-x` | Reality spiderX，默认 `/` |
+| `--spider-x` | Reality spiderX，默认空 |
 
 ## Reality 密钥
 
@@ -173,6 +173,24 @@ x-ui x25519
 ```
 
 生成的 `Private key` 和 `Public key` 可以在 Web UI 中填写，或通过 `--reality-private-key`、`--reality-public-key` 传入。
+
+## 兼容 sing-box 客户端
+
+脚本创建的入站是标准的 VLESS + Reality（TCP），sing-box 内核客户端可以直接使用。默认情况下 Reality 的 `spiderX` 为空，因此 3x-ui 生成的分享链接不会带 Xray 专用的 `spx` 参数，sing-box 导入时不会报不支持的参数。
+
+如果确实需要启用 Xray 的 spider 功能，可以显式传：
+
+```bash
+--spider-x "/path"
+```
+
+或保留 Web UI 里的设置。这样生成的分享链接会带 `spx`，可能影响部分 sing-box 客户端的导入；普通使用建议保持为空。
+
+> 说明：本脚本只负责把入站写入 3x-ui 的数据库或通过面板 API 创建。要把节点交给 sing-box 客户端使用，请在 3x-ui 面板复制分享链接或订阅，再导入 sing-box。这个改动只影响“新建入站”时写入的 `spiderX` 值。
+
+### 已存在的旧入站
+
+之前版本创建的入站已经写入了 `spiderX: "/"`，只更新脚本不会自动修改这些老入站。要让老节点也兼容 sing-box，需要手动把旧入站的 Reality `spiderX` 改成空，或者删除后重新用当前版本创建。修改后记得在 3x-ui 面板重启 Xray。
 
 ## 备份与恢复
 
